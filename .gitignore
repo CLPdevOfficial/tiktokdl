@@ -1,0 +1,5 @@
+external
+cmake-build-debug
+build
+cmake-build-tiktokdl
+.idea
