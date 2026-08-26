@@ -1,5 +1,6 @@
 external
 cmake-build-debug
 build
-cmake-build-tiktokdl
+cmake-build-release
 .idea
+yt-dlp.exe

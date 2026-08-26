@@ -46,3 +46,4 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         OpenGL::GL
         Threads::Threads
 )
+target_link_options(MyOpenGLGame PRIVATE -static-libgcc -static-libstdc++ -static)

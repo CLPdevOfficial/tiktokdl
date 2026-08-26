@@ -12,17 +12,34 @@ namespace fs = std::filesystem;
 
 Downloader::Downloader() {
     status = "Idle";
+    downloadDir = resolveDefaultDownloadDir();
 }
 
 Downloader::~Downloader() {
     if (workerThread.joinable()) {
         workerThread.detach();
     }
+    if (updateThread.joinable()) {
+        updateThread.detach();
+    }
 }
 
 void Downloader::addLog(const std::string& log) {
     logs.push_back(log);
     if (logs.size() > 500) logs.erase(logs.begin());
+}
+
+// Returns Videos\ttdownloads as the default output folder, creating it if needed
+std::string Downloader::resolveDefaultDownloadDir() {
+    char path[MAX_PATH];
+    if (SHGetFolderPathA(NULL, CSIDL_MYVIDEO, NULL, 0, path) == S_OK) {
+        fs::path outPath = fs::path(path) / "ttdownloads";
+        if (!fs::exists(outPath)) {
+            fs::create_directories(outPath);
+        }
+        return outPath.string();
+    }
+    return ".";
 }
 
 std::string Downloader::getYtDlpPath() {
@@ -48,17 +65,52 @@ bool Downloader::checkYtDlp() {
     return !getYtDlpPath().empty();
 }
 
-std::string Downloader::getDownloadDir() {
-    char path[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_MYVIDEO, NULL, 0, path) == S_OK) {
-        fs::path videoPath(path);
-        videoPath /= "TikTok_Downloads";
-        if (!fs::exists(videoPath)) {
-            fs::create_directories(videoPath);
-        }
-        return videoPath.string();
+void Downloader::updateYtDlp() {
+    if (updating) return;
+    std::string exePath = getYtDlpPath();
+    if (exePath.empty()) {
+        updateStatus = "yt-dlp not found.";
+        return;
     }
-    return ".";
+    
+    updating = true;
+    updateStatus = "Checking for updates...";
+    
+    updateThread = std::thread([this, exePath]() {
+        // Run yt-dlp.exe --update-to stable
+        std::string cmd = exePath + " --update-to stable 2>&1";
+        std::array<char, 512> buffer;
+        FILE* pipe = _popen(cmd.c_str(), "r");
+        if (!pipe) {
+            updateStatus = "Update launch failed.";
+            updating = false;
+            return;
+        }
+
+        bool updated = false;
+        bool uptodate = false;
+        
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+            std::string line(buffer.data());
+            if (line.find("up to date") != std::string::npos) {
+                uptodate = true;
+            } else if (line.find("Updated yt-dlp to") != std::string::npos) {
+                updated = true;
+            }
+        }
+        
+        _pclose(pipe);
+        
+        if (updated) {
+            updateStatus = "On the latest release";
+        } else if (uptodate) {
+            updateStatus = "On the latest release";
+        } else {
+            updateStatus = "Update check finished";
+        }
+        updating = false;
+    });
+    updateThread.detach();
 }
 
 void Downloader::downloadYtDlp(std::function<void(float)> progressCallback, std::function<void(bool)> finishCallback) {
@@ -87,8 +139,10 @@ void Downloader::downloadYtDlp(std::function<void(float)> progressCallback, std:
     workerThread.detach();
 }
 
-void Downloader::startDownload(const std::string& url, const std::string& filename, const std::string& cookiesPath,
-                               std::function<void(float)> progressCallback, std::function<void(bool, std::string)> finishCallback) {
+void Downloader::startDownload(const std::string& url, const std::string& filename,
+                               const std::string& cookiesPath, const std::string& cookiesBrowser,
+                               std::function<void(float)> progressCallback,
+                               std::function<void(bool, std::string)> finishCallback) {
     if (downloading) return;
     
     std::string exePath = getYtDlpPath();
@@ -112,16 +166,28 @@ void Downloader::startDownload(const std::string& url, const std::string& filena
         finalName += ".mp4";
     }
 
-    fs::path savePath = fs::path(getDownloadDir()) / finalName;
+    fs::path savePath = fs::path(downloadDir) / finalName;
     addLog("Saving to: " + savePath.string());
 
-    // Command to execute yt-dlp
+    // Build the yt-dlp command
     std::string cmd = exePath + " ";
+
+    // Impersonate a real Chrome TLS fingerprint via curl_cffi — this is the
+    // primary fix for TikTok's JS challenge blocking desktop requests
+    cmd += "--impersonate chrome ";
+
+    // Prefer a Netscape cookies.txt file if the user supplied one
     if (!cookiesPath.empty() && fs::exists(cookiesPath)) {
         cmd += "--cookies \"" + cookiesPath + "\" ";
-        addLog("Using cookies from: " + cookiesPath);
+        addLog("Using cookies file: " + cookiesPath);
     }
-    cmd += "-v "; // Verbose output
+    // Otherwise fall back to live extraction from the chosen browser
+    else if (!cookiesBrowser.empty()) {
+        cmd += "--cookies-from-browser " + cookiesBrowser + " ";
+        addLog("Extracting live cookies from browser: " + cookiesBrowser);
+    }
+
+    cmd += "-v "; // Verbose output for the activity log
     cmd += "-o \"" + savePath.string() + "\" ";
     cmd += "\"" + url + "\"";
 
