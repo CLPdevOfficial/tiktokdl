@@ -10,6 +10,119 @@
 
 namespace fs = std::filesystem;
 
+// ---------------------------------------------------------------------------
+// Win32 helpers — launch child processes with CREATE_NO_WINDOW so no console
+// window ever flashes on screen.
+// ---------------------------------------------------------------------------
+
+// Fire-and-forget: run `cmd` invisibly through cmd.exe /C and return the
+// process exit code (-1 on failure to launch).
+int Downloader::runSilent(const std::string& cmd) {
+    std::string cmdLine = "cmd.exe /C " + cmd;
+
+    STARTUPINFOA        si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    si.dwFlags    = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessA(nullptr, cmdLine.data(), nullptr, nullptr,
+                        FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return -1;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return static_cast<int>(exitCode);
+}
+
+// Run `cmd` invisibly through cmd.exe /C, pipe stdout+stderr back, and call
+// `lineCallback` for every line of output.  Returns the process exit code.
+int Downloader::runSilentWithOutput(const std::string& cmd,
+                                    std::function<void(const std::string&)> lineCallback) {
+    // Create an anonymous pipe for the child's stdout+stderr.
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength        = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hReadPipe  = nullptr;
+    HANDLE hWritePipe = nullptr;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return -1;
+
+    // The read end should NOT be inherited by the child.
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA        si{};
+    PROCESS_INFORMATION pi{};
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput  = hWritePipe;
+    si.hStdError   = hWritePipe;
+
+    // A GUI-subsystem app has no console stdin, so hand the child NUL instead.
+    // (Also stops yt-dlp from ever waiting on input.)
+    HANDLE hNul = CreateFileA("NUL", GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    si.hStdInput   = hNul;
+
+    // Wrap the command through cmd.exe /C so shell features (redirects, etc.)
+    // keep working, while CREATE_NO_WINDOW suppresses any window.
+    std::string cmdLine = "cmd.exe /C " + cmd;
+
+    if (!CreateProcessA(nullptr, cmdLine.data(), nullptr, nullptr,
+                        TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return -1;
+    }
+
+    // Close the write end in the parent — otherwise ReadFile will never see
+    // EOF.
+    CloseHandle(hWritePipe);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
+    // Read stdout line-by-line.
+    std::string accumulated;
+    char buf[512];
+    DWORD bytesRead = 0;
+    while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, nullptr) && bytesRead > 0) {
+        buf[bytesRead] = '\0';
+        accumulated += buf;
+
+        // Deliver complete lines to the callback.
+        std::string::size_type pos;
+        while ((pos = accumulated.find('\n')) != std::string::npos) {
+            std::string line = accumulated.substr(0, pos);
+            // Trim trailing \r if present.
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (lineCallback) lineCallback(line);
+            accumulated.erase(0, pos + 1);
+        }
+    }
+    // Flush any remaining partial line.
+    if (!accumulated.empty()) {
+        if (!accumulated.empty() && accumulated.back() == '\r') accumulated.pop_back();
+        if (lineCallback) lineCallback(accumulated);
+    }
+
+    CloseHandle(hReadPipe);
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return static_cast<int>(exitCode);
+}
+
+// ---------------------------------------------------------------------------
+
 Downloader::Downloader() {
     status = "Idle";
     downloadDir = resolveDefaultDownloadDir();
@@ -43,21 +156,42 @@ std::string Downloader::resolveDefaultDownloadDir() {
 }
 
 std::string Downloader::getYtDlpPath() {
-    if (!cachedYtDlpPath.empty() && fs::exists(cachedYtDlpPath)) return cachedYtDlpPath;
+    std::lock_guard<std::mutex> lock(pathMutex);
+    if (pathChecked) return cachedYtDlpPath;
 
-    // Check current directory for executable
+    // 1. Check current directory
     if (fs::exists("yt-dlp.exe")) {
         cachedYtDlpPath = "yt-dlp.exe";
+        pathChecked = true;
         return cachedYtDlpPath;
     }
 
-    // Check if yt-dlp is installed in PATH
-    int res = std::system("yt-dlp --version > nul 2>&1");
-    if (res == 0) {
-        cachedYtDlpPath = "yt-dlp"; // Just use the command instead of the direct executable
+    // 2. Check next to application binary or parent directory (e.g. running from build folder)
+    char exeBuf[MAX_PATH];
+    if (GetModuleFileNameA(NULL, exeBuf, MAX_PATH) > 0) {
+        fs::path exeDir = fs::path(exeBuf).parent_path();
+        if (fs::exists(exeDir / "yt-dlp.exe")) {
+            cachedYtDlpPath = (exeDir / "yt-dlp.exe").string();
+            pathChecked = true;
+            return cachedYtDlpPath;
+        }
+        if (fs::exists(exeDir.parent_path() / "yt-dlp.exe")) {
+            cachedYtDlpPath = (exeDir.parent_path() / "yt-dlp.exe").string();
+            pathChecked = true;
+            return cachedYtDlpPath;
+        }
+    }
+
+    // 3. Search system PATH using Win32 API (instant < 0.1ms, no cmd/python process spawned)
+    char foundPath[MAX_PATH];
+    DWORD len = SearchPathA(NULL, "yt-dlp.exe", NULL, MAX_PATH, foundPath, NULL);
+    if (len > 0 && len < MAX_PATH) {
+        cachedYtDlpPath = std::string(foundPath);
+        pathChecked = true;
         return cachedYtDlpPath;
     }
 
+    pathChecked = true;
     return "";
 }
 
@@ -67,40 +201,32 @@ bool Downloader::checkYtDlp() {
 
 void Downloader::updateYtDlp() {
     if (updating) return;
-    std::string exePath = getYtDlpPath();
-    if (exePath.empty()) {
-        updateStatus = "yt-dlp not found.";
-        return;
-    }
-    
+
     updating = true;
     updateStatus = "Checking for updates...";
-    
-    updateThread = std::thread([this, exePath]() {
-        // Run yt-dlp.exe --update-to stable
-        std::string cmd = exePath + " --update-to stable 2>&1";
-        std::array<char, 512> buffer;
-        FILE* pipe = _popen(cmd.c_str(), "r");
-        if (!pipe) {
-            updateStatus = "Update launch failed.";
+
+    updateThread = std::thread([this]() {
+        std::string exePath = getYtDlpPath();
+        if (exePath.empty()) {
+            updateStatus = "yt-dlp not found.";
             updating = false;
             return;
         }
 
-        bool updated = false;
+        // Run yt-dlp.exe --update-to stable
+        std::string cmd = "\"" + exePath + "\" --update-to stable 2>&1";
+
+        bool updated  = false;
         bool uptodate = false;
-        
-        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-            std::string line(buffer.data());
+
+        runSilentWithOutput(cmd, [&](const std::string& line) {
             if (line.find("up to date") != std::string::npos) {
                 uptodate = true;
             } else if (line.find("Updated yt-dlp to") != std::string::npos) {
                 updated = true;
             }
-        }
-        
-        _pclose(pipe);
-        
+        });
+
         if (updated) {
             updateStatus = "On the latest release";
         } else if (uptodate) {
@@ -120,13 +246,17 @@ void Downloader::downloadYtDlp(std::function<void(float)> progressCallback, std:
     addLog("Initiating yt-dlp download via PowerShell...");
 
     workerThread = std::thread([this, progressCallback, finishCallback]() {
-        // Use PowerShell for better reliability
+        // Use PowerShell for better reliability — run silently via CreateProcess
         std::string cmd = "powershell -Command \"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile 'yt-dlp.exe'\"";
-        int result = std::system(cmd.c_str());
-        
+        int result = runSilent(cmd);
+
         downloading = false;
         if (result == 0 && fs::exists("yt-dlp.exe")) {
-            cachedYtDlpPath = "yt-dlp.exe";
+            {
+                std::lock_guard<std::mutex> lock(pathMutex);
+                cachedYtDlpPath = "yt-dlp.exe";
+                pathChecked = true;
+            }
             status = "yt-dlp installed locally.";
             addLog("yt-dlp.exe downloaded successfully to local directory.");
             if (finishCallback) finishCallback(true);
@@ -144,7 +274,7 @@ void Downloader::startDownload(const std::string& url, const std::string& filena
                                std::function<void(float)> progressCallback,
                                std::function<void(bool, std::string)> finishCallback) {
     if (downloading) return;
-    
+
     std::string exePath = getYtDlpPath();
     if (exePath.empty()) {
         status = "Error: yt-dlp not found.";
@@ -196,40 +326,24 @@ void Downloader::startDownload(const std::string& url, const std::string& filena
 }
 
 void Downloader::runYtDlp(std::string cmd, std::function<void(float)> progressCallback, std::function<void(bool, std::string)> finishCallback) {
-    std::array<char, 512> buffer;
-    
     addLog("Executing command: " + cmd);
     cmd += " 2>&1"; // Merge stderr to stdout
-    
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) {
-        downloading = false;
-        status = "Launch Failed";
-        addLog("ERROR: Failed to open pipe for command execution.");
-        if (finishCallback) finishCallback(false, "");
-        return;
-    }
 
     std::regex progressRegex(R"(\[download\]\s+(\d+\.?\d*)%)");
-    std::smatch match;
 
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        std::string line(buffer.data());
-        // Remove trailing newline
-        line.erase(line.find_last_not_of(" \n\r\t") + 1);
-        
+    int returnCode = runSilentWithOutput(cmd, [&](const std::string& line) {
         addLog(line);
 
+        std::smatch match;
         if (std::regex_search(line, match, progressRegex)) {
             progress = std::stof(match[1]) / 100.0f;
             status = "Downloading... " + match[1].str() + "%";
             if (progressCallback) progressCallback(progress);
         }
-    }
+    });
 
-    int returnCode = _pclose(pipe);
     downloading = false;
-    
+
     if (returnCode == 0) {
         status = "Success!";
         progress = 1.0f;

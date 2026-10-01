@@ -5,6 +5,8 @@
 #include <vector>
 #include <functional>
 
+#include <mutex>
+
 class Downloader {
 public:
     Downloader();
@@ -47,6 +49,8 @@ private:
     std::string status;
     std::string updateStatus = "Checking for updates...";
     std::string downloadDir;
+    std::mutex pathMutex;
+    bool pathChecked{false};
     std::string cachedYtDlpPath;
     std::vector<std::string> logs;
     std::thread workerThread;
@@ -54,4 +58,12 @@ private:
 
     void addLog(const std::string& log);
     void runYtDlp(std::string cmd, std::function<void(float)> progressCallback, std::function<void(bool, std::string)> finishCallback);
+
+    // Win32 helpers — run child processes with CREATE_NO_WINDOW so no CMD
+    // window flashes on screen.  runSilent() is fire-and-forget (returns exit
+    // code); runSilentWithOutput() pipes stdout+stderr back through a
+    // line-by-line callback and then returns the exit code.
+    static int  runSilent(const std::string& cmd);
+    static int  runSilentWithOutput(const std::string& cmd,
+                                    std::function<void(const std::string&)> lineCallback);
 };

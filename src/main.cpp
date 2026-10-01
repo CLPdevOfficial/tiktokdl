@@ -10,17 +10,14 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <map>
 #include <thread>
 #include <fstream>
-
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "Downloader.hpp"
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
 
 namespace fs = std::filesystem;
 
@@ -86,6 +83,49 @@ std::string OpenFolderPicker() {
         return std::string(path);
     }
     return "";
+}
+
+// Ask Windows for a video's thumbnail (the same one Explorer shows).
+// Fast, needs no ffmpeg and writes nothing to disk. Returns RGBA pixels.
+// Fails (returns false) if Windows has no thumbnail provider for the format.
+static bool GetShellThumbnail(const std::wstring& path, int size,
+                              std::vector<unsigned char>& rgba, int& w, int& h) {
+    IShellItemImageFactory* factory = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr,
+                                           IID_PPV_ARGS(&factory)))) return false;
+
+    HBITMAP hbm = nullptr;
+    SIZE sz{ size, size };
+    HRESULT hr = factory->GetImage(sz, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, &hbm);
+    factory->Release();
+    if (FAILED(hr) || !hbm) return false;
+
+    BITMAP bm{};
+    GetObject(hbm, sizeof(bm), &bm);
+    w = bm.bmWidth;
+    h = bm.bmHeight;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;          // negative = top-down rows
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    rgba.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+    HDC dc = GetDC(nullptr);
+    int lines = GetDIBits(dc, hbm, 0, h, rgba.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    DeleteObject(hbm);
+    if (lines == 0) return false;
+
+    // Windows gives BGRA; OpenGL wants RGBA. Force alpha opaque.
+    for (size_t i = 0; i < rgba.size(); i += 4) {
+        std::swap(rgba[i], rgba[i + 2]);
+        rgba[i + 3] = 255;
+    }
+    return true;
 }
 
 // Strip TikTok URL down to its base (removes query params / tracking)
@@ -232,8 +272,7 @@ void RenderDownloaderTab(ImGuiIO& io, Downloader& downloader,
     // Cookie source hint — TikTok now requires valid browser cookies to pass its
     // JS challenge; let the user know if nothing is configured
     if (std::string(cookiesPath).empty() && cookiesBrowser.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                           "Tip: Set a cookie source in Settings to fix TikTok blocks.");
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "DONT use cookies it wont work (seriously don't, like really)");
         ImGui::Dummy(ImVec2(0, 6));
     }
 
@@ -272,10 +311,10 @@ void RenderDownloaderTab(ImGuiIO& io, Downloader& downloader,
     if (ImGui::CollapsingHeader("Activity Logs")) {
         float availableY = ImGui::GetContentRegionAvail().y;
         float reservedHeight = 70.0f; // Space for the persistent footer
-        
+
         float logHeight = availableY - reservedHeight;
         if (logHeight < 150.0f) logHeight = 150.0f; // Minimum height
-        
+
         ImGui::BeginChild("LogRegion", ImVec2(0, logHeight), true);
         for (const auto& log : downloader.getLogs()) {
             ImGui::TextUnformatted(log.c_str());
@@ -285,17 +324,40 @@ void RenderDownloaderTab(ImGuiIO& io, Downloader& downloader,
     }
 }
 
+// GPU thumbnail cache for the media player. Keys are "path|modtime" so a
+// re-downloaded file with the same name gets a fresh thumbnail.
+struct ThumbCache {
+    std::map<std::string, GLuint> tex;   // 0 = Windows had no thumbnail
+    std::map<std::string, int>    w, h;
+
+    // Forget failed lookups so they are retried (e.g. file was still being written)
+    void dropFailed() {
+        for (auto it = tex.begin(); it != tex.end();) {
+            if (it->second == 0) { w.erase(it->first); h.erase(it->first); it = tex.erase(it); }
+            else ++it;
+        }
+    }
+    void drop(const std::string& key) {
+        auto it = tex.find(key);
+        if (it == tex.end()) return;
+        if (it->second != 0) glDeleteTextures(1, &it->second);
+        tex.erase(it); w.erase(key); h.erase(key);
+    }
+};
+
 void RenderMediaPlayerTab(ImGuiIO& io, const std::string& downloadDir, std::string& lastDownloadedFile, bool forceRefresh = false) {
     // Refresh button + scan
     static std::vector<VideoEntry> videos;
     static std::string scannedDir;
     static int selectedIdx = -1;
+    static ThumbCache thumbs;
 
     // Re-scan whenever the dir changes or the user requests a refresh
     bool dirChanged = (scannedDir != downloadDir);
     if (dirChanged || forceRefresh) {
         videos     = ScanVideos(downloadDir);
         scannedDir = downloadDir;
+        thumbs.dropFailed();
         if (dirChanged || forceRefresh) selectedIdx = -1; // Only reset selection if forced
     }
 
@@ -307,6 +369,7 @@ void RenderMediaPlayerTab(ImGuiIO& io, const std::string& downloadDir, std::stri
         videos      = ScanVideos(downloadDir);
         scannedDir  = downloadDir;
         selectedIdx = -1;
+        thumbs.dropFailed();
     }
 
     ImGui::Dummy(ImVec2(0, 4));
@@ -349,65 +412,43 @@ void RenderMediaPlayerTab(ImGuiIO& io, const std::string& downloadDir, std::stri
 
     if (selectedIdx >= 0 && selectedIdx < (int)videos.size()) {
         const VideoEntry& v = videos[selectedIdx];
-        
-        static std::map<std::string, GLuint> thumbTextures;
-        static std::map<std::string, int> thumbWidths;
-        static std::map<std::string, int> thumbHeights;
-        static std::string currentlyLoadingPath;
-        
-        std::string thumbPath = v.path + ".thumb.jpg";
-        
-        // If we haven't loaded it yet, check if file exists
-        if (thumbTextures.find(v.path) == thumbTextures.end()) {
-            if (fs::exists(thumbPath)) {
-                int w = 0, h = 0;
-                unsigned char* image_data = stbi_load(thumbPath.c_str(), &w, &h, NULL, 4);
-                if (image_data != NULL) {
-                    GLuint texture;
-                    glGenTextures(1, &texture);
-                    glBindTexture(GL_TEXTURE_2D, texture);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, image_data);
-                    stbi_image_free(image_data);
-                    thumbTextures[v.path] = texture;
-                    thumbWidths[v.path] = w;
-                    thumbHeights[v.path] = h;
-                } else {
-                    thumbTextures[v.path] = 0; // failed
-                }
-            } else if (currentlyLoadingPath != v.path) {
-                currentlyLoadingPath = v.path;
-                std::string cmdPath = v.path;
-                std::thread([cmdPath, thumbPath]() {
-                    // Extract a frame at 1 second using ffmpeg to a temporary file
-                    std::string tempPath = thumbPath + ".tmp.jpg";
-                    std::string cmd = ".\\ffmpeg.exe -v error -ss 00:00:01.00 -i \"" + cmdPath + "\" -frames:v 1 -q:v 2 \"" + tempPath + "\" -y";
-                    int res = std::system(cmd.c_str());
-                    if (res == 0 && fs::exists(tempPath)) {
-                        try {
-                            if (fs::exists(thumbPath)) fs::remove(thumbPath);
-                            fs::rename(tempPath, thumbPath);
-                        } catch(...) {}
-                    }
-                }).detach();
+
+        // Cache key changes if the file is replaced (same name, new content)
+        const std::string thumbKey =
+            v.path + "|" + std::to_string(v.modTime.time_since_epoch().count());
+
+        // First time this video is selected: ask Windows for its thumbnail and
+        // upload it to the GPU. Nothing is written to the video folder.
+        if (thumbs.tex.find(thumbKey) == thumbs.tex.end()) {
+            std::vector<unsigned char> px;
+            int w = 0, h = 0;
+            GLuint texture = 0;
+            if (GetShellThumbnail(fs::path(v.path).wstring(), 512, px, w, h)) {
+                glGenTextures(1, &texture);
+                glBindTexture(GL_TEXTURE_2D, texture);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                thumbs.w[thumbKey] = w;
+                thumbs.h[thumbKey] = h;
             }
+            thumbs.tex[thumbKey] = texture;   // 0 = no thumbnail available
         }
 
         float boxW = ImGui::GetContentRegionAvail().x;
         float boxH = 340.0f; // maximum preview height
-        
+
         float drawW = boxW;
         float drawH = 200.0f; // default placeholder height
-        
+
         GLuint tex = 0;
-        if (thumbTextures.find(v.path) != thumbTextures.end()) {
-            tex = thumbTextures[v.path];
+        if (thumbs.tex.find(thumbKey) != thumbs.tex.end()) {
+            tex = thumbs.tex[thumbKey];
         }
 
         if (tex != 0) {
-            float imgW = (float)thumbWidths[v.path];
-            float imgH = (float)thumbHeights[v.path];
+            float imgW = (float)thumbs.w[thumbKey];
+            float imgH = (float)thumbs.h[thumbKey];
             if (imgW > 0 && imgH > 0) {
                 // Calculate scale to fit inside boxW x boxH
                 float scale = std::min(boxW / imgW, boxH / imgH);
@@ -435,7 +476,7 @@ void RenderMediaPlayerTab(ImGuiIO& io, const std::string& downloadDir, std::stri
                 IM_COL32(20, 20, 28, 255),
                 6.0f
             );
-            const char* placeholderText = fs::exists(thumbPath) ? "[ Loading... ]" : "[ Generating Preview... ]";
+            const char* placeholderText = "[ No preview available ]";
             ImVec2 textSz = ImGui::CalcTextSize(placeholderText);
             ImGui::SetCursorScreenPos(ImVec2(
                 thumbPos.x + (drawW  - textSz.x) * 0.5f,
@@ -469,9 +510,7 @@ void RenderMediaPlayerTab(ImGuiIO& io, const std::string& downloadDir, std::stri
             std::string arg = "/select,\"" + v.path + "\"";
             ShellExecuteA(NULL, "open", "explorer.exe", arg.c_str(), NULL, SW_SHOWNORMAL);
         }
-
-        ImGui::Dummy(ImVec2(0, 8));
-
+        ImGui::Dummy(ImVec2(0, 1));
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.15f, 0.15f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
         if (ImGui::Button("Delete##del", ImVec2(-1, 36))) {
@@ -487,6 +526,7 @@ void RenderMediaPlayerTab(ImGuiIO& io, const std::string& downloadDir, std::stri
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "%s", v.name.c_str());
             ImGui::Spacing();
             if (ImGui::Button("Yes, Delete", ImVec2(120, 0))) {
+                thumbs.drop(thumbKey);
                 fs::remove(v.path);
                 // Refresh list and clear selection
                 videos      = ScanVideos(downloadDir);
@@ -565,11 +605,6 @@ void RenderSettingsTab(ImGuiIO& io, Downloader& downloader,
     ImGui::Dummy(ImVec2(0, 12));
 
     // Cookie source
-    // TikTok's web extractor now requires valid session cookies to pass its
-    // JS challenge. Without them, every download fails. The options are:
-    //   1. Let yt-dlp pull cookies live from an installed browser (easiest)
-    //   2. Export a cookies.txt file from the browser and point to it in the
-    //      Downloader tab (more portable, works without the browser open)
     ImGui::Text("Cookie Source  (required for TikTok)");
     ImGui::Dummy(ImVec2(0, 4));
 
@@ -620,19 +655,36 @@ void RenderSettingsTab(ImGuiIO& io, Downloader& downloader,
 //  Entry point
 
 int main() {
+    // Needed for the Shell thumbnail API and the folder-picker dialog
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
     if (!glfwInit()) return -1;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
-    GLFWwindow* window = glfwCreateWindow(940, 820, "TikTok Downloader", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(940, 780, "TikTok Downloader", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
     }
     glfwMakeContextCurrent(window);
     gladLoadGL();
+
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    if (monitor) {
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (mode) {
+            int monX = 0, monY = 0;
+            glfwGetMonitorPos(monitor, &monX, &monY);
+            int xpos = monX + (mode->width - 940) / 2;
+            int ypos = monY + (mode->height - 780) / 2;
+            glfwSetWindowPos(window, xpos, ypos);
+        }
+    }
+    glfwShowWindow(window);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -652,13 +704,13 @@ int main() {
     AppConfig config = LoadConfig();
     if (!config.downloadDir.empty()) downloader.setDownloadDir(config.downloadDir);
 
-    char url[1024]          = "";
-    char filename[256]      = "";
-    char cookiesPath[512]   = "";
+    char url[1024] = "";
+    char filename[256] = "";
+    char cookiesPath[512] = "";
     if (!config.cookiesPath.empty()) strncpy(cookiesPath, config.cookiesPath.c_str(), 511);
 
     char downloadDirBuf[512] = "";
-    bool autoTimestamp      = true;
+    bool autoTimestamp = true;
     std::string lastDownloadedFile = "";
     std::string cookiesBrowser = config.cookiesBrowser;
 
@@ -702,11 +754,19 @@ int main() {
 
             // GitHub link at the bottom during loading
             ImGui::SetCursorPosY(windowSize.y - 70.0f);
-            float githubWidth = ImGui::CalcTextSize("github.com/CLPdevOfficial").x;
-            ImGui::SetCursorPosX((windowSize.x - githubWidth) * 0.5f);
-            ImGui::TextDisabled("github.com/CLPdevOfficial");
+            const char* loadGithubText = "github.com/CLPdevOfficial";
+            const char* loadVerText = "v1.2";
+            float loadGithubWidth = ImGui::CalcTextSize(loadGithubText).x;
+            float loadVerWidth = ImGui::CalcTextSize(loadVerText).x;
+            float loadSpacing = 20.0f;
+            float loadTotalWidth = loadGithubWidth + loadSpacing + loadVerWidth;
 
-            if (loadingTimer > 1.0f) showLoading = false;
+            ImGui::SetCursorPosX((windowSize.x - loadTotalWidth) * 0.5f);
+            ImGui::TextDisabled("%s", loadGithubText);
+            ImGui::SameLine(0.0f, loadSpacing);
+            ImGui::TextDisabled("%s", loadVerText);
+
+            if (loadingTimer > 0.5f) showLoading = false;
 
         } else {
             // Main UI
@@ -715,7 +775,7 @@ int main() {
             ImGui::SetWindowFontScale(1.1f);
             ImGui::Text("TikTok Downloader");
             ImGui::SameLine();
-            
+
             // Show update status
             std::string upStatus = downloader.getUpdateStatus();
             float statusWidth = ImGui::CalcTextSize(upStatus.c_str()).x;
@@ -758,9 +818,9 @@ int main() {
                 // Settings tab
                 if (ImGui::BeginTabItem("Settings")) {
                     ImGui::Dummy(ImVec2(0, 8));
-                    RenderSettingsTab(io, downloader, downloadDirBuf, sizeof(downloadDirBuf), cookiesBrowser);
-                    ImGui::EndTabItem();
-                }
+                        RenderSettingsTab(io, downloader, downloadDirBuf, sizeof(downloadDirBuf), cookiesBrowser);
+                        ImGui::EndTabItem();
+                    }
 
                 ImGui::EndTabBar();
             }
@@ -768,35 +828,44 @@ int main() {
             // Persistent footer
             ImGui::SetCursorPosY(io.DisplaySize.y - 50.0f);
             ImGui::Separator();
-            float githubWidth = ImGui::CalcTextSize("github.com/CLPdevOfficial").x;
-            ImGui::SetCursorPosX((io.DisplaySize.x - githubWidth) * 0.5f);
-            if (ImGui::Selectable("github.com/CLPdevOfficial", false, 0,
-                                   ImGui::CalcTextSize("github.com/CLPdevOfficial"))) {
+            const char* githubText = "github.com/CLPdevOfficial";
+            const char* verText = "v1.2";
+            float githubWidth = ImGui::CalcTextSize(githubText).x;
+            float verWidth = ImGui::CalcTextSize(verText).x;
+            float spacing = 20.0f;
+            float totalFooterWidth = githubWidth + spacing + verWidth;
+
+            ImGui::SetCursorPosX((io.DisplaySize.x - totalFooterWidth) * 0.5f);
+            if (ImGui::Selectable(githubText, false, 0, ImGui::CalcTextSize(githubText))) {
                 ShellExecuteA(NULL, "open", "https://github.com/CLPdevOfficial", NULL, NULL, SW_SHOWNORMAL);
             }
             if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+
+            ImGui::SameLine(0.0f, spacing);
+            ImGui::TextDisabled("%s", verText);
         }
 
-        ImGui::End();
+            ImGui::End();
 
-        ImGui::Render();
-        glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        glfwSwapBuffers(window);
+            ImGui::Render();
+            glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(window);
+        }
+
+        // Save configuration before closing
+        AppConfig newConfig;
+        newConfig.downloadDir = downloader.getDownloadDir();
+        newConfig.cookiesBrowser = cookiesBrowser;
+        newConfig.cookiesPath = std::string(cookiesPath);
+        SaveConfig(newConfig);
+
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        CoUninitialize();
+        return 0;
     }
-    
-    // Save configuration before closing
-    AppConfig newConfig;
-    newConfig.downloadDir = downloader.getDownloadDir();
-    newConfig.cookiesBrowser = cookiesBrowser;
-    newConfig.cookiesPath = std::string(cookiesPath);
-    SaveConfig(newConfig);
-
-    ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    ImGui::DestroyContext();
-    glfwDestroyWindow(window);
-    glfwTerminate();
-    return 0;
-}
